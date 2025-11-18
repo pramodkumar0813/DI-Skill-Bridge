@@ -56,7 +56,7 @@ __pycache__/
 *.pot
 
 # Django Migrations (keep __init__.py)
-**/migrations/*.py
+# **/migrations/*.py
 
 # Media folder: keep the folder, ignore contents
 media/*
