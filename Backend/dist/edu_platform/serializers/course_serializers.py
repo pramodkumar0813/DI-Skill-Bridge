@@ -1,0 +1,327 @@
+from rest_framework import serializers
+from edu_platform.models import Course, CourseSubscription, ClassSchedule, ClassSession, CourseEnrollment
+from django.utils.dateformat import format as date_format
+from django.utils import timezone
+from datetime import date
+
+class CourseSerializer(serializers.ModelSerializer):
+    """Serializes course data for retrieval and updates."""
+    batches = serializers.SerializerMethodField()
+    schedule = serializers.SerializerMethodField()
+    original_price = serializers.SerializerMethodField()
+    discount_percent = serializers.SerializerMethodField()
+    final_price = serializers.SerializerMethodField()
+
+
+    class Meta:
+        model = Course
+        fields = [
+            'id', 'name', 'slug', 'description', 'category', 'level', 'thumbnail',
+            'duration_hours', 'base_price', 'advantages', 'batches', 'schedule',
+            'is_active', 'created_at', 'updated_at', 'original_price', 'discount_percent', 'final_price'
+        ]
+
+    def get_pricing_obj(self, obj):
+        return obj.pricings.first()
+
+    def get_original_price(self, obj):
+        pricing = self.get_pricing_obj(obj)
+        return str(pricing.original_price) if pricing else None
+
+    def get_discount_percent(self, obj):
+        pricing = self.get_pricing_obj(obj)
+        return str(pricing.discount_percent) if pricing else None
+
+    def get_final_price(self, obj):
+        pricing = self.get_pricing_obj(obj)
+        return str(pricing.final_price) if pricing else None
+
+    def get_batches(self, obj):
+        request = self.context.get('request')
+        today = date.today()
+        if request and request.user.role == 'teacher':
+            return list(obj.class_schedules.filter(teacher=request.user).values_list('batch', flat=True).distinct())
+        elif request and request.user.role == 'student':
+            # For MyCoursesView, only include the enrolled batch
+            if 'view' in self.context and self.context['view'].__class__.__name__ == 'MyCoursesView':
+                enrollment = CourseEnrollment.objects.filter(
+                    student=request.user,
+                    course=obj,
+                    subscription__payment_status='completed'
+                ).first()
+                if enrollment:
+                    return [enrollment.batch]
+                return []
+            # For CourseListView, include only upcoming batches (exclude ongoing)
+            return list(obj.class_schedules.filter(batch_start_date__gt=today).values_list('batch', flat=True).distinct())
+        # For admins or others, return all batches
+        return list(obj.class_schedules.values_list('batch', flat=True).distinct())
+
+    def get_schedule(self, obj):
+        request = self.context.get('request')
+        today = date.today()
+        schedules = []
+
+        if request and request.user.role == 'teacher':
+            # For teachers, return all assigned batches' schedules from ClassSchedule
+            class_schedules = obj.class_schedules.filter(teacher=request.user).order_by('batch_start_date')
+            if not class_schedules.exists():
+                return schedules  # Empty list if no schedules assigned
+            for cs in class_schedules:
+                sessions = cs.sessions.order_by('session_date', 'start_time')
+                if not sessions.exists():
+                    continue
+
+                if cs.batch == 'weekdays':
+                    first_session = sessions[0]
+                    start_str = first_session.start_time.strftime('%I:%M %p')
+                    end_str = first_session.end_time.strftime('%I:%M %p')
+                    days = sorted(set(s.session_date.strftime('%A') for s in sessions))
+                    schedules.append({
+                        'days': days,
+                        'time': f"{start_str} to {end_str}",
+                        'type': cs.batch,
+                        'batchStartDate': cs.batch_start_date.isoformat(),
+                        'batchEndDate': cs.batch_end_date.isoformat()
+                    })
+                elif cs.batch == 'weekends':
+                    saturday_sessions = [s for s in sessions if s.session_date.strftime('%A').lower() == 'saturday']
+                    sunday_sessions = [s for s in sessions if s.session_date.strftime('%A').lower() == 'sunday']
+                    
+                    saturday_time = None
+                    sunday_time = None
+                    
+                    if saturday_sessions:
+                        first_saturday = saturday_sessions[0]
+                        saturday_time = f"{first_saturday.start_time.strftime('%I:%M %p')} to {first_saturday.end_time.strftime('%I:%M %p')}"
+                    
+                    if sunday_sessions:
+                        first_sunday = sunday_sessions[0]
+                        sunday_time = f"{first_sunday.start_time.strftime('%I:%M %p')} to {first_sunday.end_time.strftime('%I:%M %p')}"
+                    
+                    if saturday_time or sunday_time:
+                        schedule_entry = {
+                            'days': [],
+                            'type': cs.batch,
+                            'batchStartDate': cs.batch_start_date.isoformat(),
+                            'batchEndDate': cs.batch_end_date.isoformat()
+                        }
+                        if saturday_time:
+                            schedule_entry['days'].append('saturday')
+                            schedule_entry['saturday_time'] = saturday_time
+                        if sunday_time:
+                            schedule_entry['days'].append('sunday')
+                            schedule_entry['sunday_time'] = sunday_time
+                        schedules.append(schedule_entry)
+
+        elif request and request.user.role == 'student':
+            # For MyCoursesView, use enrollment data for the specific batch schedule
+            if 'view' in self.context and self.context['view'].__class__.__name__ == 'MyCoursesView':
+                enrollment = CourseEnrollment.objects.filter(
+                    student=request.user,
+                    course=obj,
+                    subscription__payment_status='completed'
+                ).first()
+                if enrollment:
+                    schedule_entry = {
+                        'type': enrollment.batch,
+                        'batchStartDate': enrollment.start_date.isoformat() if enrollment.start_date else None,
+                        'batchEndDate': enrollment.end_date.isoformat() if enrollment.end_date else None
+                    }
+                    if enrollment.batch == 'weekdays':
+                        if enrollment.start_time and enrollment.end_time:
+                            start_str = enrollment.start_time.strftime('%I:%M %p')
+                            end_str = enrollment.end_time.strftime('%I:%M %p')
+                            # Assuming weekdays are standard (Mon-Fri), adjust if specific days are stored elsewhere
+                            schedule_entry['days'] = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+                            schedule_entry['time'] = f"{start_str} to {end_str}"
+                        else:
+                            return schedules  # Empty list if schedule data is incomplete
+                    elif enrollment.batch == 'weekends':
+                        schedule_entry['days'] = []
+                        if enrollment.saturday_start_time and enrollment.saturday_end_time:
+                            schedule_entry['days'].append('saturday')
+                            schedule_entry['saturday_time'] = f"{enrollment.saturday_start_time.strftime('%I:%M %p')} to {enrollment.saturday_end_time.strftime('%I:%M %p')}"
+                        if enrollment.sunday_start_time and enrollment.sunday_end_time:
+                            schedule_entry['days'].append('sunday')
+                            schedule_entry['sunday_time'] = f"{enrollment.sunday_start_time.strftime('%I:%M %p')} to {enrollment.sunday_end_time.strftime('%I:%M %p')}"
+                        if not schedule_entry['days']:
+                            return schedules  # Empty list if no valid weekend schedule
+                    if schedule_entry['days']:
+                        schedules.append(schedule_entry)
+            else:
+                # For CourseListView, include only upcoming batches (exclude ongoing)
+                class_schedules = obj.class_schedules.filter(batch_start_date__gt=today).order_by('batch_start_date')
+                for cs in class_schedules:
+                    sessions = cs.sessions.order_by('session_date', 'start_time')
+                    if not sessions.exists():
+                        continue
+
+                    if cs.batch == 'weekdays':
+                        first_session = sessions[0]
+                        start_str = first_session.start_time.strftime('%I:%M %p')
+                        end_str = first_session.end_time.strftime('%I:%M %p')
+                        days = sorted(set(s.session_date.strftime('%A') for s in sessions))
+                        schedules.append({
+                            'days': days,
+                            'time': f"{start_str} to {end_str}",
+                            'type': cs.batch,
+                            'batchStartDate': cs.batch_start_date.isoformat(),
+                            'batchEndDate': cs.batch_end_date.isoformat()
+                        })
+                    elif cs.batch == 'weekends':
+                        saturday_sessions = [s for s in sessions if s.session_date.strftime('%A').lower() == 'saturday']
+                        sunday_sessions = [s for s in sessions if s.session_date.strftime('%A').lower() == 'sunday']
+                        
+                        saturday_time = None
+                        sunday_time = None
+                        
+                        if saturday_sessions:
+                            first_saturday = saturday_sessions[0]
+                            saturday_time = f"{first_saturday.start_time.strftime('%I:%M %p')} to {first_saturday.end_time.strftime('%I:%M %p')}"
+                        
+                        if sunday_sessions:
+                            first_sunday = sunday_sessions[0]
+                            sunday_time = f"{first_sunday.start_time.strftime('%I:%M %p')} to {first_sunday.end_time.strftime('%I:%M %p')}"
+                        
+                        if saturday_time or sunday_time:
+                            schedule_entry = {
+                                'days': [],
+                                'type': cs.batch,
+                                'batchStartDate': cs.batch_start_date.isoformat(),
+                                'batchEndDate': cs.batch_end_date.isoformat()
+                            }
+                            if saturday_time:
+                                schedule_entry['days'].append('saturday')
+                                schedule_entry['saturday_time'] = saturday_time
+                            if sunday_time:
+                                schedule_entry['days'].append('sunday')
+                                schedule_entry['sunday_time'] = sunday_time
+                            schedules.append(schedule_entry)
+        else:
+            # For admins or others, return all schedules
+            class_schedules = obj.class_schedules.all().order_by('batch_start_date')
+            for cs in class_schedules:
+                sessions = cs.sessions.order_by('session_date', 'start_time')
+                if not sessions.exists():
+                    continue
+
+                if cs.batch == 'weekdays':
+                    first_session = sessions[0]
+                    start_str = first_session.start_time.strftime('%I:%M %p')
+                    end_str = first_session.end_time.strftime('%I:%M %p')
+                    days = sorted(set(s.session_date.strftime('%A') for s in sessions))
+                    schedules.append({
+                        'days': days,
+                        'time': f"{start_str} to {end_str}",
+                        'type': cs.batch,
+                        'batchStartDate': cs.batch_start_date.isoformat(),
+                        'batchEndDate': cs.batch_end_date.isoformat()
+                    })
+                elif cs.batch == 'weekends':
+                    saturday_sessions = [s for s in sessions if s.session_date.strftime('%A').lower() == 'saturday']
+                    sunday_sessions = [s for s in sessions if s.session_date.strftime('%A').lower() == 'sunday']
+                    
+                    saturday_time = None
+                    sunday_time = None
+                    
+                    if saturday_sessions:
+                        first_saturday = saturday_sessions[0]
+                        saturday_time = f"{first_saturday.start_time.strftime('%I:%M %p')} to {first_saturday.end_time.strftime('%I:%M %p')}"
+                    
+                    if sunday_sessions:
+                        first_sunday = sunday_sessions[0]
+                        sunday_time = f"{first_sunday.start_time.strftime('%I:%M %p')} to {first_sunday.end_time.strftime('%I:%M %p')}"
+                    
+                    if saturday_time or sunday_time:
+                        schedule_entry = {
+                            'days': [],
+                            'type': cs.batch,
+                            'batchStartDate': cs.batch_start_date.isoformat(),
+                            'batchEndDate': cs.batch_end_date.isoformat()
+                        }
+                        if saturday_time:
+                            schedule_entry['days'].append('saturday')
+                            schedule_entry['saturday_time'] = saturday_time
+                        if sunday_time:
+                            schedule_entry['days'].append('sunday')
+                            schedule_entry['sunday_time'] = sunday_time
+                        schedules.append(schedule_entry)
+
+        return schedules
+
+class MyCoursesSerializer(serializers.Serializer):
+    def to_representation(self, instance):
+        user = self.context['request'].user
+
+        # Handle CourseSubscription instance (student purchased courses)
+        if isinstance(instance, CourseSubscription):
+            enrollment = CourseEnrollment.objects.filter(
+                subscription=instance,
+                student=instance.student,
+                course=instance.course,
+                batch=instance.batch
+            ).first()
+
+            if not enrollment:
+                return {
+                    'message': f"No enrollment found for course {instance.course.name}.",
+                    'message_type': 'error'
+                }
+
+            course_data = CourseSerializer(instance.course, context=self.context).data
+
+            # Error handling: missing schedule
+            if not course_data.get('schedule'):
+                return {
+                    'message': f"No schedule available for your enrolled batch in {instance.course.name}.",
+                    'message_type': 'error'
+                }
+
+            # Pricing fields logic
+            if user.role == 'student':
+                # Remove all original pricing fields
+                for field in ['original_price', 'discount_percent', 'final_price', 'base_price', 'pricing']:
+                    course_data.pop(field, None)
+                # Add paid price from enrollment
+                course_data['price'] = str(enrollment.price) if enrollment.price else None
+            elif user.role == 'teacher':
+                # Remove all pricing fields for teacher view
+                for field in ['original_price', 'discount_percent', 'final_price', 'base_price', 'price', 'pricing']:
+                    course_data.pop(field, None)
+
+            return {
+                'id': instance.id,
+                'course': course_data,
+                'purchased_at': instance.purchased_at,
+                'payment_status': instance.payment_status
+            }
+
+        # Handle Course instance (assigned courses for teacher)
+        elif isinstance(instance, Course):
+            course_data = CourseSerializer(instance, context=self.context).data
+
+            # Error handling: missing schedule
+            if not course_data.get('schedule'):
+                return {
+                    'message': f"No schedule available for course {instance.name}.",
+                    'message_type': 'error',
+                }
+
+            if user.role == 'teacher':
+                # Remove all pricing fields for teacher
+                for field in ['original_price', 'discount_percent', 'final_price', 'base_price', 'price', 'pricing']:
+                    course_data.pop(field, None)
+
+            return {
+                'id': instance.id,
+                'course': course_data,
+                'purchased_at': None,
+                'payment_status': None
+            }
+
+        # Default error for invalid data
+        return {
+            'message': 'Invalid data provided for course retrieval.',
+            'message_type': 'error'
+        }
